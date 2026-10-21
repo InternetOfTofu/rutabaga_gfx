@@ -12,10 +12,12 @@ use std::path::Path;
 use rustix::cmsg_space;
 use rustix::fs::fcntl_setfl;
 use rustix::fs::OFlags;
+use rustix::io::Errno;
 use rustix::net::accept;
 use rustix::net::bind;
 use rustix::net::connect;
 use rustix::net::listen;
+use rustix::net::recv;
 use rustix::net::recvmsg;
 use rustix::net::sendmsg;
 use rustix::net::socket_with;
@@ -39,6 +41,8 @@ use crate::util::Result as MagmaGpuResult;
 use crate::util::TubeType;
 
 const MAX_IDENTIFIERS: usize = 28;
+const VPRT_FRAME_MAGIC: u32 = 0x5650_5254;
+const VPRT_FRAME_HEADER_LEN: usize = 8;
 
 pub struct Tube {
     socket: OwnedDescriptor,
@@ -101,50 +105,132 @@ impl Tube {
         opaque_data: &[u8],
         descriptors: Vec<OwnedDescriptor>,
     ) -> MagmaGpuResult<usize> {
-        let mut space = [MaybeUninit::<u8>::uninit(); cmsg_space!(ScmRights(MAX_IDENTIFIERS))];
-        let mut cmsg_buffer = SendAncillaryBuffer::new(&mut space);
+        let mut total_sent = 0usize;
+        let mut send_fds = !descriptors.is_empty();
 
-        let borrowed_fds: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
+        while total_sent < opaque_data.len() || send_fds {
+            let mut space = [MaybeUninit::<u8>::uninit(); cmsg_space!(ScmRights(MAX_IDENTIFIERS))];
+            let mut cmsg_buffer = SendAncillaryBuffer::new(&mut space);
+            let borrowed_fds: Vec<_> = if send_fds {
+                descriptors.iter().map(AsFd::as_fd).collect()
+            } else {
+                Vec::new()
+            };
+            if send_fds {
+                let cmsg = SendAncillaryMessage::ScmRights(&borrowed_fds);
+                cmsg_buffer.push(cmsg);
+            }
 
-        let cmsg = SendAncillaryMessage::ScmRights(&borrowed_fds);
-        cmsg_buffer.push(cmsg);
-
-        let bytes_sent = sendmsg(
-            &self.socket,
-            &[IoSlice::new(opaque_data)],
-            &mut cmsg_buffer,
-            SendFlags::NOSIGNAL,
-        )?;
-
-        Ok(bytes_sent)
-    }
-
-    pub fn receive(&self, opaque_data: &mut [u8]) -> MagmaGpuResult<(usize, Vec<OwnedDescriptor>)> {
-        let mut iovecs = [IoSliceMut::new(opaque_data)];
-
-        let mut space = [MaybeUninit::<u8>::uninit(); cmsg_space!(ScmRights(MAX_IDENTIFIERS))];
-        let mut cmsg_buffer = RecvAncillaryBuffer::new(&mut space);
-        let r = recvmsg(
-            &self.socket,
-            &mut iovecs,
-            &mut cmsg_buffer,
-            RecvFlags::empty(),
-        )?;
-
-        let len = r.bytes;
-        let mut received_descriptors: Vec<OwnedDescriptor> = Vec::new();
-
-        // Iterate over received control messages
-        for cmsg in cmsg_buffer.drain() {
-            match cmsg {
-                RecvAncillaryMessage::ScmRights(fds) => {
-                    received_descriptors.extend(fds.into_iter().map(Into::into));
+            let slice = &opaque_data[total_sent..];
+            match sendmsg(
+                &self.socket,
+                &[IoSlice::new(slice)],
+                &mut cmsg_buffer,
+                SendFlags::NOSIGNAL,
+            ) {
+                Ok(n) => {
+                    send_fds = false;
+                    total_sent += n;
+                    if opaque_data.is_empty() {
+                        break;
+                    }
+                    if n == 0 {
+                        return Err(IoError::new(
+                            ErrorKind::WriteZero,
+                            "failed to write whole buffer to tube",
+                        )
+                        .into());
+                    }
                 }
-                _ => return Err(Error::Unsupported), // Handle unexpected control messages
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
             }
         }
 
-        Ok((len, received_descriptors))
+        Ok(total_sent)
+    }
+
+    pub fn receive(&self, opaque_data: &mut [u8]) -> MagmaGpuResult<(usize, Vec<OwnedDescriptor>)> {
+        let is_stream = matches!(socket_type(&self.socket), Ok(SocketType::STREAM));
+        let mut expected_frame_len: Option<usize> = None;
+
+        if is_stream && opaque_data.len() >= VPRT_FRAME_HEADER_LEN {
+            let mut peek_buf = [0u8; VPRT_FRAME_HEADER_LEN];
+            loop {
+                match recv(&self.socket, &mut peek_buf, RecvFlags::PEEK) {
+                    Ok((n, _)) if n >= VPRT_FRAME_HEADER_LEN => {
+                        let magic = u32::from_le_bytes([
+                            peek_buf[0],
+                            peek_buf[1],
+                            peek_buf[2],
+                            peek_buf[3],
+                        ]);
+                        if magic == VPRT_FRAME_MAGIC {
+                            let payload_len = u32::from_le_bytes([
+                                peek_buf[4],
+                                peek_buf[5],
+                                peek_buf[6],
+                                peek_buf[7],
+                            ]) as usize;
+                            expected_frame_len = Some(
+                                VPRT_FRAME_HEADER_LEN
+                                    .saturating_add(payload_len)
+                                    .min(opaque_data.len()),
+                            );
+                        }
+                        break;
+                    }
+                    Ok(_) => break,
+                    Err(Errno::INTR) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let target_len = expected_frame_len.unwrap_or(opaque_data.len());
+        let mut received_descriptors: Vec<OwnedDescriptor> = Vec::new();
+        let mut total_read = loop {
+            let mut iovecs = [IoSliceMut::new(&mut opaque_data[..target_len])];
+            let mut space = [MaybeUninit::<u8>::uninit(); cmsg_space!(ScmRights(MAX_IDENTIFIERS))];
+            let mut cmsg_buffer = RecvAncillaryBuffer::new(&mut space);
+            match recvmsg(
+                &self.socket,
+                &mut iovecs,
+                &mut cmsg_buffer,
+                RecvFlags::empty(),
+            ) {
+                Ok(r) => {
+                    for cmsg in cmsg_buffer.drain() {
+                        match cmsg {
+                            RecvAncillaryMessage::ScmRights(fds) => {
+                                received_descriptors.extend(fds.into_iter().map(Into::into));
+                            }
+                            _ => return Err(Error::Unsupported),
+                        }
+                    }
+                    break r.bytes;
+                }
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        if let Some(frame_len) = expected_frame_len {
+            while total_read > 0 && total_read < frame_len {
+                match recv(
+                    &self.socket,
+                    &mut opaque_data[total_read..frame_len],
+                    RecvFlags::empty(),
+                ) {
+                    Ok((0, _)) => break,
+                    Ok((n, _)) => total_read += n,
+                    Err(Errno::INTR) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        Ok((total_read, received_descriptors))
     }
 }
 

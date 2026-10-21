@@ -630,6 +630,7 @@ pub const RUTABAGA_PATH_TYPE_PIPEWIRE: u32 = 0x0010;
 pub const RUTABAGA_PATH_TYPE_X11: u32 = 0x0011;
 pub const RUTABAGA_PATH_TYPE_DBUS_SESSION: u32 = 0x0012;
 pub const RUTABAGA_PATH_TYPE_DBUS_SYSTEM: u32 = 0x0013;
+pub const RUTABAGA_PATH_TYPE_NPU: u32 = 0x0014;
 
 pub type RutabagaPaths = Vec<RutabagaPath>;
 

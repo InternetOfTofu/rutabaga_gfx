@@ -21,6 +21,7 @@ rust-version = "1.81.0"
 gfxstream = []
 virgl_renderer = []
 gbm = []
+npu = []
 # Vulkano features are just a prototype and not integrated yet into the ChromeOS build system.
 vulkano = ["dep:vulkano"]
 
